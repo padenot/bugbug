@@ -17,6 +17,10 @@ MOZILLA_CORP_GROUP_ID = 42
 EDITBUGS_GROUP_ID = 9
 EDITBUGS_CUTOFF_DAYS = 365
 
+REDACTED_TITLE = "[Unvalidated bug title redacted for security]"
+REDACTED_REPORTER = "- **Reporter**: [Redacted]"
+REDACTED_ASSIGNEE = "- **Assignee**: [Redacted]"
+
 BugzillaBase.TOKEN = os.getenv("BUGZILLA_TOKEN")
 
 

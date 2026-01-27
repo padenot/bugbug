@@ -288,10 +288,19 @@ def bug_dict_to_markdown(bug):
         _sanitize_timeline_items(bug["comments"], bug["history"], is_trusted_cache)
     )
 
-    # Header with bug ID and summary
-    md_lines.append(
-        f"# Bug {bug.get('id', 'Unknown')} - {bug.get('summary', 'No summary')}"
+    # Determine if any trusted user has commented (validates all metadata)
+    has_trusted_comment = any(
+        is_trusted_cache.get(comment.get("author", ""), False)
+        for comment in bug["comments"]
     )
+
+    # Sanitize bug title if no trusted validation
+    bug_summary = bug.get("summary", "No summary")
+    if not has_trusted_comment:
+        bug_summary = REDACTED_TITLE
+
+    # Header with bug ID and summary
+    md_lines.append(f"# Bug {bug.get('id', 'Unknown')} - {bug_summary}")
     md_lines.append("")
 
     # Basic Information
@@ -319,23 +328,29 @@ def bug_dict_to_markdown(bug):
 
     creator_detail = bug.get("creator_detail", {})
     if creator_detail:
-        creator_name = creator_detail.get(
-            "real_name",
-            creator_detail.get("nick", creator_detail.get("email", "Unknown")),
-        )
-        md_lines.append(
-            f"- **Reporter**: {creator_name} ({creator_detail.get('email', 'No email')})"
-        )
+        if has_trusted_comment:
+            creator_name = creator_detail.get(
+                "real_name",
+                creator_detail.get("nick", creator_detail.get("email", "Unknown")),
+            )
+            md_lines.append(
+                f"- **Reporter**: {creator_name} ({creator_detail.get('email', 'No email')})"
+            )
+        else:
+            md_lines.append(REDACTED_REPORTER)
 
     assignee_detail = bug.get("assigned_to_detail", {})
     if assignee_detail:
-        assignee_name = assignee_detail.get(
-            "real_name",
-            assignee_detail.get("nick", assignee_detail.get("email", "Unknown")),
-        )
-        md_lines.append(
-            f"- **Assignee**: {assignee_name} ({assignee_detail.get('email', 'No email')})"
-        )
+        if has_trusted_comment:
+            assignee_name = assignee_detail.get(
+                "real_name",
+                assignee_detail.get("nick", assignee_detail.get("email", "Unknown")),
+            )
+            md_lines.append(
+                f"- **Assignee**: {assignee_name} ({assignee_detail.get('email', 'No email')})"
+            )
+        else:
+            md_lines.append(REDACTED_ASSIGNEE)
 
     # CC List (summarized)
     cc_count = len(bug.get("cc", []))

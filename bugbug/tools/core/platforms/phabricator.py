@@ -464,15 +464,48 @@ class PhabricatorPatch(Patch):
         md_lines = []
 
         revision = self._revision_metadata
-        md_lines.append(f"# Revision D{revision['id']}: {revision['fields']['title']}")
+
+        # Get all comments first to determine if there's trusted validation
+        all_comments = list(
+            comment for comment in self.get_comments() if comment.content.strip()
+        )
+        author_phid = revision["fields"]["authorPHID"]
+        user_phids = {comment.author_phid for comment in all_comments} | {author_phid}
+        users_info = _get_users_info_batch(user_phids)
+
+        # Check if any trusted user has commented (validates all metadata)
+        has_trusted_comment = any(
+            users_info.get(comment.author_phid, {}).get("is_trusted", False)
+            for comment in all_comments
+        )
+
+        # Sanitize metadata if no trusted validation
+        revision_title = revision['fields']['title']
+        if not has_trusted_comment:
+            revision_title = "[Unvalidated revision title redacted for security]"
+
+        md_lines.append(f"# Revision D{revision['id']}: {revision_title}")
         md_lines.append("")
         md_lines.append("")
 
         md_lines.append("## Basic Information")
         md_lines.append("")
         md_lines.append(f"- **URI**: {revision['fields']['uri']}")
-        md_lines.append(f"- **Revision Author**: {revision['fields']['authorPHID']}")
-        md_lines.append(f"- **Title**: {revision['fields']['title']}")
+
+        # Sanitize author display
+        if has_trusted_comment:
+            author_info = users_info.get(author_phid, {})
+            author_email = author_info.get("email", "Unknown")
+            author_real_name = author_info.get("real_name", "")
+            if author_real_name:
+                author_display = f"{author_real_name} ({author_email})"
+            else:
+                author_display = author_email
+            md_lines.append(f"- **Revision Author**: {author_display}")
+        else:
+            md_lines.append("- **Revision Author**: [Redacted]")
+
+        md_lines.append(f"- **Title**: {revision_title}")
         md_lines.append(f"- **Status**: {revision['fields']['status']['name']}")
         md_lines.append(f"- **Created**: {self.date_created.strftime(date_format)}")
         md_lines.append(f"- **Modified**: {self.date_modified.strftime(date_format)}")
@@ -485,7 +518,10 @@ class PhabricatorPatch(Patch):
         if summary:
             md_lines.append("## Summary")
             md_lines.append("")
-            md_lines.append(summary)
+            if has_trusted_comment:
+                md_lines.append(summary)
+            else:
+                md_lines.append("[Unvalidated summary redacted for security]")
             md_lines.append("")
             md_lines.append("")
 
@@ -493,7 +529,10 @@ class PhabricatorPatch(Patch):
         if test_plan:
             md_lines.append("## Test Plan")
             md_lines.append("")
-            md_lines.append(test_plan)
+            if has_trusted_comment:
+                md_lines.append(test_plan)
+            else:
+                md_lines.append("[Unvalidated test plan redacted for security]")
             md_lines.append("")
             md_lines.append("")
 
@@ -502,7 +541,17 @@ class PhabricatorPatch(Patch):
         md_lines.append(f"- **Diff ID**: {diff['id']}")
         md_lines.append(f"- **Base Revision**: `{diff['baseRevision']}`")
         if revision["fields"]["authorPHID"] != diff["authorPHID"]:
-            md_lines.append(f"- **Diff Author**: {diff['authorPHID']}")
+            if has_trusted_comment:
+                diff_author_info = users_info.get(diff["authorPHID"], {})
+                diff_author_email = diff_author_info.get("email", "Unknown")
+                diff_author_real_name = diff_author_info.get("real_name", "")
+                if diff_author_real_name:
+                    diff_author_display = f"{diff_author_real_name} ({diff_author_email})"
+                else:
+                    diff_author_display = diff_author_email
+                md_lines.append(f"- **Diff Author**: {diff_author_display}")
+            else:
+                md_lines.append("- **Diff Author**: [Redacted]")
         md_lines.append("")
         md_lines.append("")
 
@@ -528,13 +577,18 @@ class PhabricatorPatch(Patch):
             for phid, dependencies in stack_graph.items():
                 from_patch = patch_map[phid]
                 from_id = f"D{from_patch.revision_id}"
+                if has_trusted_comment:
+                    patch_title = from_patch.patch_title
+                else:
+                    patch_title = "[Redacted]"
+
                 if phid == current_phid:
                     md_lines.append(
-                        f"    {from_id}[{from_patch.patch_title} - CURRENT]"
+                        f"    {from_id}[{patch_title} - CURRENT]"
                     )
                     md_lines.append(f"    style {from_id} fill:#105823")
                 else:
-                    md_lines.append(f"    {from_id}[{from_patch.patch_title}]")
+                    md_lines.append(f"    {from_id}[{patch_title}]")
 
                 for dep_phid in dependencies:
                     dep_id = f"D{patch_map[dep_phid].revision_id}"
@@ -561,20 +615,11 @@ class PhabricatorPatch(Patch):
         md_lines.append("## Comments Timeline")
         md_lines.append("")
 
-        # Get all comments and sort by date
-        all_comments = sorted(
-            # Ignore empty comments
-            (comment for comment in self.get_comments() if comment.content.strip()),
-            key=lambda c: c.date_created,
-        )
-
-        author_phid = revision["fields"]["authorPHID"]
-        user_phids = {comment.author_phid for comment in all_comments} | {author_phid}
-
-        users_info = _get_users_info_batch(user_phids)
+        # Sort comments by date (already fetched above)
+        sorted_comments = sorted(all_comments, key=lambda c: c.date_created)
 
         comments_to_display, filtered_count = _sanitize_comments(
-            all_comments, users_info
+            sorted_comments, users_info
         )
 
         for comment in comments_to_display:

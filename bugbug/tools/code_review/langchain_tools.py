@@ -5,10 +5,10 @@
 
 """LangGraph tools for code review agent."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cache
 from logging import getLogger
-from typing import Literal, Optional
+from typing import Optional
 
 import httpx
 import tenacity
@@ -32,12 +32,6 @@ _retry = tenacity.retry(
 def _tool_error(message: str, *, fatal: bool = False) -> str:
     prefix = "Fatal" if fatal else "Warning"
     return f"{prefix}: {message}"
-
-
-LangStr = Literal[
-    "cpp", "c", "js", "webidl", "java", "kotlin", "rust", "python", "html", "css"
-]
-Tests = Optional[Literal["only", "exclude"]]
 
 
 @dataclass
@@ -71,8 +65,8 @@ async def _fetch_file(
 @tool
 async def expand_context(
     file_path: str,
-    start_line: Optional[int] = None,
-    end_line: Optional[int] = None,
+    start_line: int = 0,
+    end_line: int = 0,
 ) -> str:
     """Retrieve the content of a file, optionally restricted to a line range.
 
@@ -82,8 +76,8 @@ async def expand_context(
 
     Args:
         file_path: Repository-relative path, e.g. 'dom/media/webaudio/AudioNode.h'.
-        start_line: Starting line number (1-based). Omit to start from the beginning.
-        end_line: Ending line number (inclusive). Omit to read to the end of the file.
+        start_line: Starting line number (1-based). Omit (or 0) to start from the beginning.
+        end_line: Ending line number (inclusive). Omit (or 0) to read to the end of the file.
 
     Returns:
         The file content, with line numbers prefixed.
@@ -112,8 +106,8 @@ async def expand_context(
         return f"Warning: could not retrieve {file_path}: {e}."
 
     lines = file_content.splitlines()
-    start = max(1, start_line) - 1 if start_line is not None else 0
-    end = min(len(lines), end_line) if end_line is not None else len(lines)
+    start = max(1, start_line) - 1 if start_line else 0
+    end = min(len(lines), end_line) if end_line else len(lines)
 
     line_number_width = len(str(end))
     content = "\n".join(
@@ -158,294 +152,309 @@ def create_load_skill_tool(skills: list[Skill]):
     return load_skill
 
 
+def _parse_line_range(spec: str, total: int) -> tuple[int, int]:
+    """Parse '10-20', '10-', '-20', '10' into a (start, end) index pair."""
+    if "-" in spec:
+        lo, hi = spec.split("-", 1)
+        start = (int(lo) - 1) if lo else 0
+        end = int(hi) if hi else total
+    else:
+        n = int(spec)
+        start, end = n - 1, n
+    return max(0, start), min(total, end)
+
+
+def _parse_blame_lines(spec: str) -> list[int]:
+    """Parse '10,20,30' or '10-20' into a list of 1-based line numbers."""
+    if "-" in spec and "," not in spec:
+        lo, hi = spec.split("-", 1)
+        return list(range(int(lo), int(hi) + 1))
+    return [int(x.strip()) for x in spec.split(",")]
+
+
+SEARCHFOX_OPERATIONS = {
+    "query": "query",
+    "id": "id",
+    "define": "define",
+    "calls-from": "calls_from",
+    "calls-to": "calls_to",
+    "calls-between": "calls_between",
+    "can-gc": "can_gc",
+    "function-at": "function_at",
+    "get-file": "get_file",
+    "field-layout": "field_layout",
+    "blame": "blame",
+}
+
+SEARCHFOX_PRIMARY_FIELDS = tuple(SEARCHFOX_OPERATIONS.values())
+
+SEARCHFOX_LANG_FLAGS = {
+    "cpp",
+    "c",
+    "js",
+    "webidl",
+    "java",
+    "kotlin",
+    "rust",
+    "python",
+    "html",
+    "css",
+}
+
+
+@dataclass
+class SearchfoxCommand:
+    query: str | None = None
+    id: str | None = None
+    define: str | None = None
+    calls_from: str | None = None
+    calls_to: str | None = None
+    calls_between: str | None = None
+    can_gc: str | None = None
+    function_at: str | None = None
+    get_file: str | None = None
+    field_layout: str | None = None
+    blame: str | None = None
+    path: str | None = None
+    regexp: bool = False
+    case: bool = False
+    limit: int = 50
+    context: int | None = None
+    lines: str | None = None
+    depth: int = 2
+    langs: list[str] = field(default_factory=list)
+    tests: str | None = None
+
+    @property
+    def operation(self) -> str | None:
+        operations = self.operations
+        if len(operations) == 1:
+            return operations[0]
+        return None
+
+    @property
+    def operations(self) -> list[str]:
+        return [
+            field
+            for field in SEARCHFOX_PRIMARY_FIELDS
+            if getattr(self, field) is not None
+        ]
+
+
+def _parse_searchfox_command(command: str) -> SearchfoxCommand:
+    import shlex
+
+    args = shlex.split(command)
+    parsed = SearchfoxCommand()
+    i = 0
+
+    while i < len(args):
+        token = args[i]
+        if token in SEARCHFOX_OPERATIONS and i + 1 < len(args):
+            setattr(parsed, SEARCHFOX_OPERATIONS[token], args[i + 1])
+            i += 2
+        elif token in {"path", "lines"} and i + 1 < len(args):
+            setattr(parsed, token, args[i + 1])
+            i += 2
+        elif token in {"depth", "limit", "context"} and i + 1 < len(args):
+            setattr(parsed, token, int(args[i + 1]))
+            i += 2
+        elif token == "regexp":
+            parsed.regexp = True
+            i += 1
+        elif token == "case-sensitive":
+            parsed.case = True
+            i += 1
+        elif token == "exclude-tests":
+            parsed.tests = "exclude"
+            i += 1
+        elif token == "only-tests":
+            parsed.tests = "only"
+            i += 1
+        elif token in SEARCHFOX_LANG_FLAGS:
+            parsed.langs.append(token)
+            i += 1
+        else:
+            i += 1
+
+    return parsed
+
+
+def _format_search_results(results) -> str:
+    if not results:
+        return "No results found."
+    return "\n".join(f"{path}:{line}: {content}" for path, line, content in results)
+
+
 @tool
-async def search_text(
-    query: str,
-    path_filter: Optional[str] = None,
-    langs: Optional[list[LangStr]] = None,
-    tests: Tests = None,
-    regexp: bool = False,
-    case_sensitive: bool = False,
-    limit: int = 50,
-    context_lines: Optional[int] = None,
-) -> str:
-    """Search for text or patterns across the codebase.
+async def searchfox(command: str) -> str:
+    """Search and navigate the Firefox codebase using Searchfox.
 
-    Args:
-        query: Text or regular expression to search for.
-        path_filter: Optional path prefix, e.g. 'dom/media'.
-        langs: Optional language filter. Multiple values are OR-ed.
-        tests: 'only' to restrict to test files, 'exclude' to omit them.
-        regexp: Treat query as a regular expression.
-        case_sensitive: Enable case-sensitive matching.
-        limit: Maximum number of results (default 50).
-        context_lines: Surrounding lines to include per match.
+    Syntax: <operation> <value> [modifiers...]
 
-    Returns:
-        Matching lines as 'path:line: content' entries.
+    Operations (set exactly one):
+      query <text>                   text or regex search
+      id <identifier>                exact identifier search
+      define <symbol>                full definition of a symbol or class
+      calls-from <symbol>            outgoing calls from symbol
+      calls-to <symbol>              incoming callers of symbol
+      calls-between <symbol>,<symbol> call paths between two symbols
+      can-gc <symbol>                check if C++ function can trigger GC
+      function-at <file>:<line>      function/class enclosing a line
+      get-file <file>                file content
+      field-layout <class>           C++ class memory layout
+      blame <file>                   commit info for lines; requires lines modifier
+
+    Modifiers:
+      path <prefix>      filter results by path prefix
+      depth <N>          call graph traversal depth (default 2)
+      limit <N>          max results (default 50)
+      context <N>        surrounding lines per match
+      lines <range>      line range: 10-20, 10, 10-, -20, or 10,20,30 (blame)
+      regexp             treat query as regular expression
+      case-sensitive     enable case-sensitive matching
+      exclude-tests      omit test files
+      only-tests         restrict to test files
+      cpp  c  js  webidl  java  kotlin  rust  python  html  css   (language filters)
+
+    Examples:
+      searchfox("query AudioStream cpp")
+      searchfox("define mozilla::dom::AudioContext")
+      searchfox("calls-from AudioNode::Connect depth 2")
+      searchfox("get-file dom/media/AudioStream.h lines 10-50")
+      searchfox("blame dom/media/AudioStream.cpp lines 42,43,44")
+      searchfox("query AudioStream path dom/media regexp")
     """
-    try:
-        results = await _get_client().search(
-            query=query,
-            path=path_filter,
-            langs=langs,
-            tests=tests,
-            regexp=regexp,
-            case=case_sensitive,
-            limit=limit,
-            context=context_lines,
+    parsed = _parse_searchfox_command(command)
+    client = _get_client()
+
+    if not parsed.operations:
+        return _tool_error(
+            "No operation set. Use one of: query, id, define, calls-from, "
+            "calls-to, calls-between, can-gc, function-at, get-file, field-layout, blame.",
+            fatal=True,
         )
-        if not results:
-            return "No results found."
-        return "\n".join(f"{path}:{line}: {content}" for path, line, content in results)
-    except Exception as e:  # searchfox raises plain Exception
-        logger.error("Error searching for '%s': %s", query, e)
-        return _tool_error(f"search failed: {e}")
-
-
-@tool
-async def get_field_layout(
-    class_name: str,
-) -> str:
-    """Show the memory layout of a C++ class or struct, including field offsets and sizes.
-
-    Args:
-        class_name: Fully-qualified class name, e.g. 'mozilla::dom::AudioContext'.
-
-    Returns:
-        Field layout as JSON.
-    """
-    try:
-        return await _get_client().search_field_layout(class_name)
-    except Exception as e:  # searchfox raises plain Exception
-        logger.error("Error fetching field layout for '%s': %s", class_name, e)
-        return _tool_error(f"field layout fetch failed: {e}")
-
-
-@tool
-async def get_blame(
-    file_path: str,
-    lines: list[int],
-) -> str:
-    """Get the commit that last modified each of the given lines in a file.
-
-    Args:
-        file_path: Repository-relative path, e.g. 'dom/media/webaudio/AudioNode.cpp'.
-        lines: List of 1-based line numbers to look up.
-
-    Returns:
-        For each line: 'LINE: HASH (DATE) MESSAGE'.
-    """
-    try:
-        results = await _get_client().get_blame_for_lines(file_path, lines)
-        if not results:
-            return "No blame information found."
-        return "\n".join(
-            f"{line}: {hash_} ({date}) {message}"
-            for line, hash_, message, date in results
+    if len(parsed.operations) > 1:
+        return _tool_error(
+            f"Multiple operations set: {', '.join(parsed.operations)}. Set exactly one.",
+            fatal=True,
         )
-    except Exception as e:  # searchfox raises plain Exception
-        logger.error("Error fetching blame for '%s': %s", file_path, e)
-        return _tool_error(f"blame fetch failed: {e}")
+    op = parsed.operation
 
+    async def _run() -> str:
+        match op:
+            case "query":
+                results = await _retry(client.search)(
+                    query=parsed.query,
+                    path=parsed.path,
+                    langs=parsed.langs or None,
+                    tests=parsed.tests,
+                    regexp=parsed.regexp,
+                    case=parsed.case,
+                    limit=parsed.limit,
+                    context=parsed.context,
+                )
+                return _format_search_results(results)
 
-@tool
-async def check_can_gc(
-    symbol: str,
-) -> str:
-    """Check whether a C++ function can trigger garbage collection in SpiderMonkey.
+            case "id":
+                results = await _retry(client.search)(
+                    id=parsed.id,
+                    path=parsed.path,
+                    langs=parsed.langs or None,
+                    tests=parsed.tests,
+                    limit=parsed.limit,
+                )
+                return _format_search_results(results)
 
-    Accepts partial names (e.g. 'CreateGain') or fully-qualified names
-    (e.g. 'mozilla::dom::AudioContext::CreateGain').
+            case "define":
+                return await _retry(client.get_definition)(parsed.define, parsed.path)
 
-    Args:
-        symbol: Function name to check.
+            case "calls_from":
+                return await _retry(client.search_call_graph)(
+                    calls_from=parsed.calls_from, depth=parsed.depth
+                )
 
-    Returns:
-        For each match: whether it can GC, and the GC call path if available.
-    """
+            case "calls_to":
+                return await _retry(client.search_call_graph)(
+                    calls_to=parsed.calls_to, depth=parsed.depth
+                )
+
+            case "calls_between":
+                calls_between = parsed.calls_between
+                assert calls_between is not None
+                parts = calls_between.split(",", 1)
+                if len(parts) != 2:
+                    return _tool_error("calls-between requires 'SymbolA,SymbolB'")
+                return await _retry(client.search_call_graph)(
+                    calls_between=(parts[0].strip(), parts[1].strip()),
+                    depth=parsed.depth,
+                )
+
+            case "can_gc":
+                results = await _retry(client.get_gc_info)(parsed.can_gc)
+                if not results:
+                    return "No GC information found. GC analysis is only available for C++ functions."
+                out = []
+                for pretty, _mangled, gc, path in results:
+                    entry = f"{pretty}: {'can GC' if gc else 'cannot GC'}"
+                    if path:
+                        entry += f" (via {path})"
+                    out.append(entry)
+                return "\n".join(out)
+
+            case "function_at":
+                spec = parsed.function_at
+                assert spec is not None
+                if ":" not in spec:
+                    return _tool_error("function-at requires 'path:line' format")
+                file_path, line_str = spec.rsplit(":", 1)
+                try:
+                    line_num = int(line_str)
+                except ValueError:
+                    return _tool_error(f"invalid line number: {line_str!r}")
+                return await _retry(client.get_function_at_line)(file_path, line_num)
+
+            case "get_file":
+                content = await _retry(client.get_file)(parsed.get_file)
+                if not parsed.lines:
+                    return content
+                file_lines = content.splitlines()
+                start, end = _parse_line_range(parsed.lines, len(file_lines))
+                width = len(str(end))
+                return "\n".join(
+                    f"{i + 1:>{width}}| {file_lines[i]}" for i in range(start, end)
+                )
+
+            case "field_layout":
+                return await _retry(client.search_field_layout)(parsed.field_layout)
+
+            case "blame":
+                if not parsed.lines:
+                    return _tool_error(
+                        "blame requires lines (e.g. lines 10,20 or lines 10-20)"
+                    )
+                line_nums = _parse_blame_lines(parsed.lines)
+                results = await _retry(client.get_blame_for_lines)(
+                    parsed.blame, line_nums
+                )
+                if not results:
+                    return "No blame information found."
+                return "\n".join(
+                    f"{ln}: {hash_} ({date}) {message}"
+                    for ln, hash_, message, date in results
+                )
+
+            case _:
+                return _tool_error("unreachable", fatal=True)
+
     try:
-        results = await _get_client().get_gc_info(symbol)
-        if not results:
-            return "No GC information found. GC analysis is only available for C++ functions."
-        lines = []
-        for pretty, _mangled, can_gc, gc_path in results:
-            status = "can GC" if can_gc else "cannot GC"
-            line = f"{pretty}: {status}"
-            if gc_path:
-                line += f" (via {gc_path})"
-            lines.append(line)
-        return "\n".join(lines)
-    except Exception as e:  # searchfox raises plain Exception
-        logger.error("Error checking GC status for '%s': %s", symbol, e)
-        return _tool_error(f"GC check failed: {e}")
-
-
-@tool
-async def find_definition(
-    name: str,
-    path_filter: Optional[str] = None,
-) -> str:
-    """Find the definition of a function, method, class, or struct.
-
-    Accepts partial names (e.g. 'AudioNode') or fully-qualified names
-    (e.g. 'mozilla::dom::AudioNode' or 'AudioNode::Connect').
-
-    Args:
-        name: Symbol name to look up.
-        path_filter: Optional path prefix, e.g. 'dom/media'.
-
-    Returns:
-        The definition source.
-    """
-    try:
-        return await _get_client().get_definition(name, path_filter)
-    except Exception as e:  # searchfox raises plain Exception
-        logger.error("Error finding definition for '%s': %s", name, e)
-        return _tool_error(f"definition lookup failed: {e}")
-
-
-@tool
-async def search_identifier(
-    identifier: str,
-    path_filter: Optional[str] = None,
-    langs: Optional[list[LangStr]] = None,
-    tests: Tests = None,
-    limit: int = 50,
-) -> str:
-    """Search for an exact identifier across the codebase.
-
-    Args:
-        identifier: Identifier to search for.
-        path_filter: Optional path prefix, e.g. 'dom/media'.
-        langs: Optional language filter. Multiple values are OR-ed.
-        tests: 'only' to restrict to test files, 'exclude' to omit them.
-        limit: Maximum number of results (default 50).
-
-    Returns:
-        Matching lines as 'path:line: content' entries.
-    """
-    try:
-        results = await _get_client().search(
-            id=identifier,
-            path=path_filter,
-            langs=langs,
-            tests=tests,
-            limit=limit,
-        )
-        if not results:
-            return "No results found."
-        return "\n".join(f"{path}:{line}: {content}" for path, line, content in results)
-    except Exception as e:  # searchfox raises plain Exception
-        logger.error("Error searching for identifier '%s': %s", identifier, e)
-        return _tool_error(f"identifier search failed: {e}")
-
-
-@tool
-async def calls_from(
-    symbol: str,
-    depth: int = 2,
-) -> str:
-    """Find functions called by the given symbol (outgoing calls).
-
-    Args:
-        symbol: Fully-qualified function or method name, e.g. 'mozilla::dom::AudioNode::Connect'.
-        depth: Levels of calls to traverse (default 2).
-
-    Returns:
-        Call graph as JSON.
-    """
-    try:
-        return await _get_client().search_call_graph(calls_from=symbol, depth=depth)
-    except Exception as e:  # searchfox raises plain Exception
-        logger.error("Error fetching calls from '%s': %s", symbol, e)
-        return _tool_error(f"call graph fetch failed: {e}")
-
-
-@tool
-async def calls_to(
-    symbol: str,
-    depth: int = 2,
-) -> str:
-    """Find functions that call the given symbol (incoming calls).
-
-    Args:
-        symbol: Fully-qualified function or method name, e.g. 'mozilla::dom::AudioNode::Connect'.
-        depth: Levels of callers to traverse (default 2).
-
-    Returns:
-        Call graph as JSON.
-    """
-    try:
-        return await _get_client().search_call_graph(calls_to=symbol, depth=depth)
-    except Exception as e:  # searchfox raises plain Exception
-        logger.error("Error fetching calls to '%s': %s", symbol, e)
-        return _tool_error(f"call graph fetch failed: {e}")
-
-
-@tool
-async def calls_between(
-    symbol_a: str,
-    symbol_b: str,
-    depth: int = 2,
-) -> str:
-    """Find call paths between two symbols or classes.
-
-    Args:
-        symbol_a: First fully-qualified symbol or class name, e.g. 'mozilla::dom::AudioContext'.
-        symbol_b: Second fully-qualified symbol or class name.
-        depth: Levels to traverse (default 2).
-
-    Returns:
-        Call graph as JSON.
-    """
-    try:
-        return await _get_client().search_call_graph(
-            calls_between=(symbol_a, symbol_b), depth=depth
-        )
-    except Exception as e:  # searchfox raises plain Exception
-        logger.error(
-            "Error fetching calls between '%s' and '%s': %s", symbol_a, symbol_b, e
-        )
-        return _tool_error(f"call graph fetch failed: {e}")
-
-
-@tool
-async def get_function_at_line(
-    file_path: str,
-    line: int,
-) -> str:
-    """Get the source of the innermost function enclosing a given line.
-
-    Useful when you know a line number and want the full function body without
-    having to know the function name.
-
-    Args:
-        file_path: Repository-relative path, e.g. 'dom/media/webaudio/AudioNode.cpp'.
-        line: 1-based line number inside the function.
-
-    Returns:
-        The function source.
-    """
-    try:
-        return await _get_client().get_function_at_line(file_path, line)
-    except Exception as e:  # searchfox raises plain Exception
-        logger.error(
-            "Error fetching function at line %d in '%s': %s", line, file_path, e
-        )
-        return _tool_error(f"function lookup failed: {e}")
+        return await _run()
+    except Exception as e:
+        logger.error("searchfox error: %s", e)
+        return _tool_error(f"searchfox failed: {e}")
 
 
 SEARCHFOX_TOOLS = [
     expand_context,
-    search_text,
-    get_blame,
-    get_field_layout,
-    find_definition,
-    get_function_at_line,
-    search_identifier,
-    calls_from,
-    calls_to,
-    calls_between,
-    check_can_gc,
+    searchfox,
 ]

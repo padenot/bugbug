@@ -8,7 +8,7 @@
 from dataclasses import dataclass
 from functools import cache
 from logging import getLogger
-from typing import Literal, Optional
+from typing import Optional
 
 import httpx
 import tenacity
@@ -33,11 +33,6 @@ def _tool_error(message: str, *, fatal: bool = False) -> str:
     prefix = "Fatal" if fatal else "Warning"
     return f"{prefix}: {message}"
 
-
-LangStr = Literal[
-    "cpp", "c", "js", "webidl", "java", "kotlin", "rust", "python", "html", "css"
-]
-Tests = Optional[Literal["only", "exclude"]]
 
 
 @dataclass
@@ -68,11 +63,18 @@ async def _fetch_file(
     return await _retry(client.get_file)(path)
 
 
+def _strip_git_prefix(path: str) -> str:
+    """Strip a/ or b/ git diff prefixes from file paths."""
+    if path.startswith(("a/", "b/")):
+        return path[2:]
+    return path
+
+
 @tool
 async def expand_context(
     file_path: str,
-    start_line: Optional[int] = None,
-    end_line: Optional[int] = None,
+    start_line: int = 0,
+    end_line: int = 0,
 ) -> str:
     """Retrieve the content of a file, optionally restricted to a line range.
 
@@ -82,8 +84,8 @@ async def expand_context(
 
     Args:
         file_path: Repository-relative path, e.g. 'dom/media/webaudio/AudioNode.h'.
-        start_line: Starting line number (1-based). Omit to start from the beginning.
-        end_line: Ending line number (inclusive). Omit to read to the end of the file.
+        start_line: Starting line number (1-based). Omit (or 0) to start from the beginning.
+        end_line: Ending line number (inclusive). Omit (or 0) to read to the end of the file.
 
     Returns:
         The file content, with line numbers prefixed.
@@ -104,6 +106,7 @@ async def expand_context(
     async def fetch(path: str) -> str:
         return await _fetch_file(path, revision, client, patch)
 
+    file_path = _strip_git_prefix(file_path)
     try:
         file_content = await get_file_after_stack(patch_stack, file_path, fetch)
     except FileNotFoundError:
@@ -112,8 +115,8 @@ async def expand_context(
         return f"Warning: could not retrieve {file_path}: {e}."
 
     lines = file_content.splitlines()
-    start = max(1, start_line) - 1 if start_line is not None else 0
-    end = min(len(lines), end_line) if end_line is not None else len(lines)
+    start = max(1, start_line) - 1 if start_line else 0
+    end = min(len(lines), end_line) if end_line else len(lines)
 
     line_number_width = len(str(end))
     content = "\n".join(
@@ -161,21 +164,21 @@ def create_load_skill_tool(skills: list[Skill]):
 @tool
 async def search_text(
     query: str,
-    path_filter: Optional[str] = None,
-    langs: Optional[list[LangStr]] = None,
-    tests: Tests = None,
+    path_filter: str = "",
+    langs: list[str] = [],
+    tests: str = "",
     regexp: bool = False,
     case_sensitive: bool = False,
     limit: int = 50,
-    context_lines: Optional[int] = None,
+    context_lines: int = 0,
 ) -> str:
     """Search for text or patterns across the codebase.
 
     Args:
         query: Text or regular expression to search for.
-        path_filter: Optional path prefix, e.g. 'dom/media'.
-        langs: Optional language filter. Multiple values are OR-ed.
-        tests: 'only' to restrict to test files, 'exclude' to omit them.
+        path_filter: Path prefix filter, e.g. 'dom/media'. Empty = no filter.
+        langs: Language filter, e.g. ['cpp', 'js']. Valid: cpp c js webidl java kotlin rust python html css.
+        tests: 'only' to restrict to test files, 'exclude' to omit them. Empty = no filter.
         regexp: Treat query as a regular expression.
         case_sensitive: Enable case-sensitive matching.
         limit: Maximum number of results (default 50).
@@ -187,13 +190,13 @@ async def search_text(
     try:
         results = await _get_client().search(
             query=query,
-            path=path_filter,
-            langs=langs,
-            tests=tests,
+            path=path_filter or None,
+            langs=langs or None,
+            tests=tests or None,
             regexp=regexp,
             case=case_sensitive,
             limit=limit,
-            context=context_lines,
+            context=context_lines or None,
         )
         if not results:
             return "No results found."
@@ -236,6 +239,7 @@ async def get_blame(
     Returns:
         For each line: 'LINE: HASH (DATE) MESSAGE'.
     """
+    file_path = _strip_git_prefix(file_path)
     try:
         results = await _get_client().get_blame_for_lines(file_path, lines)
         if not results:
@@ -284,7 +288,7 @@ async def check_can_gc(
 @tool
 async def find_definition(
     name: str,
-    path_filter: Optional[str] = None,
+    path_filter: str = "",
 ) -> str:
     """Find the definition of a function, method, class, or struct.
 
@@ -293,13 +297,13 @@ async def find_definition(
 
     Args:
         name: Symbol name to look up.
-        path_filter: Optional path prefix, e.g. 'dom/media'.
+        path_filter: Path prefix filter, e.g. 'dom/media'. Empty = no filter.
 
     Returns:
         The definition source.
     """
     try:
-        return await _get_client().get_definition(name, path_filter)
+        return await _get_client().get_definition(name, path_filter or None)
     except Exception as e:  # searchfox raises plain Exception
         logger.error("Error finding definition for '%s': %s", name, e)
         return _tool_error(f"definition lookup failed: {e}")
@@ -308,18 +312,18 @@ async def find_definition(
 @tool
 async def search_identifier(
     identifier: str,
-    path_filter: Optional[str] = None,
-    langs: Optional[list[LangStr]] = None,
-    tests: Tests = None,
+    path_filter: str = "",
+    langs: list[str] = [],
+    tests: str = "",
     limit: int = 50,
 ) -> str:
     """Search for an exact identifier across the codebase.
 
     Args:
         identifier: Identifier to search for.
-        path_filter: Optional path prefix, e.g. 'dom/media'.
-        langs: Optional language filter. Multiple values are OR-ed.
-        tests: 'only' to restrict to test files, 'exclude' to omit them.
+        path_filter: Path prefix filter, e.g. 'dom/media'. Empty = no filter.
+        langs: Language filter, e.g. ['cpp', 'js']. Valid: cpp c js webidl java kotlin rust python html css.
+        tests: 'only' to restrict to test files, 'exclude' to omit them. Empty = no filter.
         limit: Maximum number of results (default 50).
 
     Returns:
@@ -328,9 +332,9 @@ async def search_identifier(
     try:
         results = await _get_client().search(
             id=identifier,
-            path=path_filter,
-            langs=langs,
-            tests=tests,
+            path=path_filter or None,
+            langs=langs or None,
+            tests=tests or None,
             limit=limit,
         )
         if not results:
@@ -427,6 +431,7 @@ async def get_function_at_line(
     Returns:
         The function source.
     """
+    file_path = _strip_git_prefix(file_path)
     try:
         return await _get_client().get_function_at_line(file_path, line)
     except Exception as e:  # searchfox raises plain Exception

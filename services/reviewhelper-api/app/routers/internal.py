@@ -11,6 +11,7 @@ from app.auth import verify_internal_api_key
 from app.database.connection import get_db
 from app.database.models import ReviewRequest
 from app.enums import ReviewStatus
+from app.logging_context import bind_review_context
 from app.review_processor import (
     ReviewProcessingError,
     RevisionNotYetPublicError,
@@ -71,6 +72,12 @@ async def process_review_request(
     if not review_request:
         logger.error("Review request %s not found", review_request_id)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    bind_review_context(
+        review_request_id=review_request.id,
+        revision_id=review_request.revision_id,
+        diff_id=review_request.diff_id,
+    )
 
     if review_request.status.is_final:
         logger.error(

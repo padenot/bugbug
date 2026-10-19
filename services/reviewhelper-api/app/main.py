@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from app import __version__
 from app.config import settings
 from app.database.connection import close_db, init_db
+from app.logging_context import ReviewLoggingMiddleware, install_review_logging
 from app.routers import feedback_router, internal_router, request_router
 
 sentry_sdk.init(
@@ -22,6 +23,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+install_review_logging()
 
 
 @asynccontextmanager
@@ -37,6 +39,7 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+app.add_middleware(ReviewLoggingMiddleware)
 
 
 app.include_router(request_router)

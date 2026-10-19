@@ -31,6 +31,25 @@ FastAPI backend for Mozilla's Review Helper supporting both Phabricator and GitH
 
 Once the server is running, visit `/docs` for interactive API documentation.
 
+## Review logs
+
+Logs emitted while handling a review include the available `review_request_id`,
+`revision_id`, and `diff_id`, including logs from libraries such as HTTPX and
+Uvicorn. The identifiers follow concurrent tasks independently and remain set
+through publication and request cleanup. Startup and health logs have no review
+identifiers.
+
+For example:
+
+```text
+[review_request_id=3457 revision_id=334842 diff_id=1410580] HTTP Request: GET ...
+```
+
+In Cloud Logging, filter the service's logs with
+`textPayload=~"review_request_id=3457([^0-9]|$)"` to match the exact request ID.
+The revision and diff identifiers become available after the review
+request is loaded; the processing URL supplies the request ID before that lookup.
+
 ## Cloud SQL Setup
 
 This application supports Google Cloud SQL for PostgreSQL with two connection methods:

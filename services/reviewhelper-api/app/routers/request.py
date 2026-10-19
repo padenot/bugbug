@@ -11,6 +11,7 @@ from app.auth import verify_external_api_key
 from app.database.connection import get_db
 from app.database.models import ReviewRequest
 from app.enums import Platform, ReviewStatus
+from app.logging_context import bind_review_context
 from app.schemas.review_request import ReviewRequestCreate, ReviewRequestResponse
 from app.tasks import create_review_task
 
@@ -48,6 +49,7 @@ async def create_or_get_review_request(
     - If the request already exists, returns current status/result
     - If new, creates the request with status=pending and queues processing
     """
+    bind_review_context(revision_id=request.revision_id, diff_id=request.diff_id)
     stmt = (
         select(ReviewRequest)
         .where(
@@ -61,6 +63,10 @@ async def create_or_get_review_request(
     existing_request = await db.scalar(stmt)
     # We don't support re-processing the same diff or reviewing older diffs
     if existing_request and (request.diff_id <= existing_request.diff_id):
+        bind_review_context(
+            review_request_id=existing_request.id,
+            diff_id=existing_request.diff_id,
+        )
         return JSONResponse(
             {
                 "status": existing_request.status.value,
@@ -81,6 +87,7 @@ async def create_or_get_review_request(
     )
     db.add(review_request)
     await db.commit()
+    bind_review_context(review_request_id=review_request.id)
 
     schedule_time = (
         request.revision_created_at + INITIAL_TASK_DELAY
